@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -6,6 +6,7 @@ using TMPro;
 using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.UI;
+using UnityEngine.AddressableAssets;
 using YARG.Core;
 using YARG.Core.Extensions;
 using YARG.Core.Game;
@@ -68,34 +69,54 @@ namespace YARG.Menu.DifficultySelect
         [SerializeField]
         private DifficultyItem _difficultyGreenPrefab;
         [SerializeField]
-        private DifficultyItem _difficultyRedPrefab;
-        [SerializeField]
         private DifficultyItem _difficultyItemSmallRedPrefab;
         [SerializeField]
         private ModifierItem _modifierItemPrefab;
 
-        private int _playerIndex;
-        private int _vocalModifierSelectIndex = -1;
+        private sealed class PlayerMenuPanel
+        {
+            public YargPlayer Player;
+            public List<YargPlayer> VocalPlayers;
+            public RectTransform Root;
+            public Transform Container;
+            public NavigationGroup NavGroup;
+            public TextMeshProUGUI HeaderText;
+            public Image HeaderIcon;
+            public Scrollbar Scrollbar;
 
-        private State _lastMenuState;
-        private State _menuState;
+            public State MenuState;
+            public State LastMenuState;
 
-        private readonly List<Instrument> _possibleInstruments  = new();
-        private readonly List<Difficulty> _possibleDifficulties = new();
-        private readonly List<Modifier>   _possibleModifiers    = new();
+            public int MaxHarmonyIndex;
+            public Modifier ExcusableModifiers;
 
-        [NonSerialized]
-        private Modifier _excusableModifiers;
+            public bool IsReady;
+            public bool IsVocalGroup;
 
-        private int _maxHarmonyIndex = 3;
+            public readonly List<Instrument> PossibleInstruments = new();
+            public readonly List<Difficulty> PossibleDifficulties = new();
+            public readonly List<Modifier> PossibleModifiers = new();
+            public readonly List<ModifierItem> ModifierItems = new();
 
-        private readonly List<ModifierItem> _modifierItems = new();
+            public NavigationGroup.SelectionAction SelectionHandler;
+        }
+
+        private readonly List<PlayerMenuPanel> _panels = new();
+        private readonly Dictionary<YargPlayer, PlayerMenuPanel> _panelByPlayer = new();
+        private readonly HashSet<YargPlayer> _readyPlayers = new();
+
+        private RectTransform _menuTemplate;
+        private RectTransform _menusRoot;
+
+        private YargPlayer _vocalModifierOwner;
+        private YargPlayer _lastActivePlayer;
+        private int _globalMaxHarmonyIndex = 3;
+        private float _headerBaseFontSize;
+        private static readonly Dictionary<string, Sprite> _headerIconCache = new();
+        private const float HeaderIconSize = 40f;
+        private static readonly Vector2 HeaderIconAnchoredPosition = new(40f, 0f);
 
         private List<SongEntry> _songList;
-
-        private YargPlayer CurrentPlayer => PlayerContainer.Players[_playerIndex];
-
-        private Scrollbar _scrollbar;
 
         private void OnEnable()
         {
@@ -105,28 +126,10 @@ namespace YARG.Menu.DifficultySelect
             // Set navigation scheme
             Navigator.Instance.PushScheme(new NavigationScheme(new()
             {
-                NavigationScheme.Entry.NavigateUp,
-                NavigationScheme.Entry.NavigateDown,
-                NavigationScheme.Entry.NavigateSelect,
-                new NavigationScheme.Entry(MenuAction.Red, "Menu.Common.Back", () =>
-                {
-                    if (_menuState == State.Main)
-                    {
-                        if (_playerIndex == 0)
-                        {
-                            MenuManager.Instance.PopMenu();
-                        }
-                        else
-                        {
-                            ChangePlayer(-1);
-                        }
-                    }
-                    else
-                    {
-                        _menuState = State.Main;
-                        UpdateForPlayer();
-                    }
-                })
+                new NavigationScheme.Entry(MenuAction.Up, "Menu.Common.Up", HandleNavigation),
+                new NavigationScheme.Entry(MenuAction.Down, "Menu.Common.Down", HandleNavigation),
+                new NavigationScheme.Entry(MenuAction.Green, "Menu.Common.Confirm", HandleNavigation),
+                new NavigationScheme.Entry(MenuAction.Red, "Menu.Common.Back", HandleBack)
             }, false));
 
             _speedInput.text = $"{Mathf.RoundToInt(_songSpeed * 100f)}%";
@@ -142,211 +145,59 @@ namespace YARG.Menu.DifficultySelect
                 _songList = new List<SongEntry> { GlobalVariables.State.CurrentSong };
             }
 
-            // ChangePlayer(0) will update for the current player
-            _playerIndex = 0;
-            _vocalModifierSelectIndex = -1;
-            ChangePlayer(0);
-
             _loadingPhrase.text = RichTextUtils.StripRichTextTags(
                 GlobalVariables.State.CurrentSong.LoadingPhrase, RichTextTags.BadTags);
 
             _sourceIcon.sprite = SongSources.SourceToIcon(GlobalVariables.State.CurrentSong.Source);
             _sourceIcon.gameObject.SetActive(_sourceIcon.sprite != null);
 
+            SetupMenuPanels();
+            RebuildAllPlayers();
+            LayoutPanels();
 
-            _scrollbar = GetComponentInChildren<Scrollbar>();
-            _navGroup.SelectionChanged += UpdateForSelectionChanged;
+            _lastActivePlayer = PlayerContainer.Players.FirstOrDefault();
+            UpdateWarningForPlayer(_lastActivePlayer);
+        }
+        private void HandleNavigation(NavigationContext context)
+        {
+            if (!TryGetPanel(context.Player, out var panel)) return;
+
+            _lastActivePlayer = context.Player;
+            UpdateWarningForPlayer(context.Player);
+
+            switch (context.Action)
+            {
+                case MenuAction.Up:
+                    panel.NavGroup?.SelectPrevious(context.IsRepeat);
+                    break;
+                case MenuAction.Down:
+                    panel.NavGroup?.SelectNext(context.IsRepeat);
+                    break;
+                case MenuAction.Green:
+                    panel.NavGroup?.ConfirmSelection();
+                    break;
+            }
         }
 
-        private void UpdateForSelectionChanged(NavigatableBehaviour navigatableBehaviour,
-            SelectionOrigin selectionOrigin)
+        private void HandleBack(NavigationContext context)
         {
-            if (!_scrollbar)
+            if (!TryGetPanel(context.Player, out var panel)) return;
+
+            _lastActivePlayer = context.Player;
+            UpdateWarningForPlayer(context.Player);
+
+            if (panel.MenuState == State.Main)
             {
+                if (PlayerContainer.Players.Count > 0 &&
+                    PlayerContainer.Players[0] == panel.Player)
+                {
+                    MenuManager.Instance.PopMenu();
+                }
                 return;
             }
 
-            int? index = _navGroup.SelectedIndex;
-            if (index is { } i)
-            {
-                int count = _navGroup.Count;
-                float highScrollBound = _scrollbar.size + (1 - _scrollbar.size) * _scrollbar.value;
-                float lowScrollBound = (1 - _scrollbar.size) * _scrollbar.value;
-                float indexHighBound = 1 - (1 / (float) count) * i;
-                float indexLowBound = 1 - (1 / (float) count) * (i + 1);
-                if (highScrollBound < indexHighBound)
-                {
-                    _scrollbar.value = (indexHighBound - _scrollbar.size) / (1 - _scrollbar.size);
-                }
-                else if (lowScrollBound > indexLowBound)
-                {
-                    _scrollbar.value = indexLowBound / (1 - _scrollbar.size);
-                }
-            }
-        }
-
-        private void UpdateForPlayer()
-        {
-            // Set player text
-            var profile = CurrentPlayer.Profile;
-            _text.text = $"<sprite name=\"{profile.GameMode.ToResourceName()}\"> {profile.Name}";
-
-            // Reset content
-            _navGroup.ClearNavigatables();
-            _container.DestroyChildren();
-            StatsManager.Instance.UpdateActivePlayers();
-
-            // Create the menu
-            switch (_menuState)
-            {
-                case State.Main:
-                    CreateMainMenu();
-                    break;
-                case State.Instrument:
-                    CreateInstrumentMenu();
-                    break;
-                case State.Difficulty:
-                    CreateDifficultyMenu();
-                    break;
-                case State.Modifiers:
-                    CreateModifierMenu();
-                    break;
-                case State.Harmony:
-                    CreateHarmonyMenu();
-                    break;
-            }
-
-            _lastMenuState = _menuState;
-        }
-
-        private void CreateMainMenu()
-        {
-            var player = CurrentPlayer;
-
-            if (player.IsMissingMicrophone)
-            {
-                ShowWarning(Localize.Key("Menu.DifficultySelect.WarningVocalistNoMicrophone"));
-            }
-            else if (player.IsMissingInputDevice)
-            {
-                ShowWarning(Localize.Key("Menu.DifficultySelect.WarningPlayerNoInputDevice"));
-            }
-            else
-            {
-                ShowWarning(null);
-            }
-
-            // Only show all these options if there are instruments available
-            if (_possibleInstruments.Count > 0)
-            {
-                // Ready button
-                CreateItem(LocalizeHeader("Ready"), _lastMenuState == State.Main, _difficultyGreenPrefab, () =>
-                {
-                    // If the player just selected vocal modifiers, don't show them again
-                    if (player.Profile.GameMode == GameMode.Vocals &&
-                        _vocalModifierSelectIndex == -1)
-                    {
-                        _vocalModifierSelectIndex = _playerIndex;
-                    }
-
-                    ChangePlayer(1);
-                });
-
-                CreateItem(LocalizeHeader("Instrument"),
-                    player.Profile.CurrentInstrument.ToLocalizedName(),
-                    _lastMenuState == State.Instrument, () =>
-                {
-                    _menuState = State.Instrument;
-                    UpdateForPlayer();
-                });
-
-                CreateItem(LocalizeHeader("Difficulty"),
-                    player.Profile.CurrentDifficulty.ToLocalizedName(),
-                    _lastMenuState == State.Difficulty, () =>
-                {
-                    _menuState = State.Difficulty;
-                    UpdateForPlayer();
-                });
-
-                // Harmony players must pick their harmony index
-                if (player.Profile.CurrentInstrument == Instrument.Harmony)
-                {
-                    CreateItem(LocalizeHeader("Harmony"),
-                        (player.Profile.HarmonyIndex + 1).ToString(),
-                        _lastMenuState == State.Harmony, () =>
-                    {
-                        _menuState = State.Harmony;
-                        UpdateForPlayer();
-                    });
-                }
-
-                // Only allow vocal modifiers to be selected once (so they don't conflict)
-                if (player.Profile.GameMode != GameMode.Vocals ||
-                    _vocalModifierSelectIndex == -1 ||
-                    _vocalModifierSelectIndex == _playerIndex)
-                {
-                    // Create modifiers body text
-                    string modifierText = "";
-                    if ((player.Profile.CurrentModifiers & ~_excusableModifiers) == Modifier.None)
-                    {
-                        // If there are no modifiers (ignoring the excusable ones), then just say "none"
-                        modifierText = Modifier.None.ToLocalizedName();
-                    }
-                    else
-                    {
-                        // Combine all modifiers
-                        foreach (var modifier in _possibleModifiers)
-                        {
-                            if (!player.Profile.IsModifierActive(modifier)) continue;
-
-                            modifierText += modifier.ToLocalizedName() + "\n";
-                        }
-
-                        modifierText = modifierText.Trim();
-                    }
-
-                    CreateItem(LocalizeHeader("Modifiers"),
-                        modifierText, _lastMenuState == State.Modifiers, () =>
-                    {
-                        _menuState = State.Modifiers;
-                        UpdateForPlayer();
-                    });
-                }
-            }
-
-            // Only show if there is more than one play, only if there is instruments available
-            if (_possibleInstruments.Count <= 0 || PlayerContainer.Players.Count != 1)
-            {
-                // Sit out button
-                CreateItem(LocalizeHeader("SitOut"), _possibleInstruments.Count <= 0, _difficultyItemSmallRedPrefab, () =>
-                {
-                    // If the user went back to sit out, and the vocal modifiers were selected,
-                    // deselect them.
-                    if (_vocalModifierSelectIndex == _playerIndex)
-                    {
-                        _vocalModifierSelectIndex = -1;
-                    }
-
-                    player.SittingOut = true;
-                    ChangePlayer(1);
-                });
-
-                // Disconnect button
-                CreateItem(LocalizeHeader("Disconnect"), _possibleInstruments.Count <= 0, _difficultyItemSmallRedPrefab, () =>
-                {
-                    // If the user disconnected, and the vocal modifiers were selected,
-                    // deselect them.
-                    if (_vocalModifierSelectIndex == _playerIndex)
-                    {
-                        _vocalModifierSelectIndex = -1;
-                    }
-
-                    PlayerContainer.DisposePlayer(player);
-
-                    // Since we're removing one player from the active players list, don't increment the player index.
-                    ChangePlayer(0);
-                });
-            }
+            panel.MenuState = State.Main;
+            UpdateForPlayer(panel);
         }
 
         private void ShowWarning(string message)
@@ -363,125 +214,348 @@ namespace YARG.Menu.DifficultySelect
             }
         }
 
-        private void CreateInstrumentMenu()
+        private void UpdateForSelectionChanged(PlayerMenuPanel panel, NavigatableBehaviour navigatableBehaviour,
+            SelectionOrigin selectionOrigin)
         {
-            foreach (var instrument in _possibleInstruments)
+            if (panel.Scrollbar == null) return;
+
+            int? index = panel.NavGroup.SelectedIndex;
+            if (index is { } i)
             {
-                bool selected = CurrentPlayer.Profile.CurrentInstrument == instrument;
-                CreateItem(instrument.ToLocalizedName(), selected, () =>
+                int count = panel.NavGroup.Count;
+                float highScrollBound = panel.Scrollbar.size + (1 - panel.Scrollbar.size) * panel.Scrollbar.value;
+                float lowScrollBound = (1 - panel.Scrollbar.size) * panel.Scrollbar.value;
+                float indexHighBound = 1 - (1 / (float) count) * i;
+                float indexLowBound = 1 - (1 / (float) count) * (i + 1);
+                if (highScrollBound < indexHighBound)
                 {
-                    var preferredInstrument = CurrentPlayer.Profile.PreferredInstrument;
-                    CurrentPlayer.Profile.CurrentInstrument = instrument;
-
-                    // What we are doing here is resetting preferred instrument only if the current preferred instrument
-                    // was an option for this chart. This ensures that preferred instrument does not change when the
-                    // player is forced to use a different instrument.
-                    if (instrument != preferredInstrument && _possibleInstruments.Contains(preferredInstrument))
-                    {
-                        CurrentPlayer.Profile.PreferredInstrument = instrument;
-                    }
-
-                    UpdatePossibleDifficulties();
-                    UpdatePossibleModifiers();
-
-                    _menuState = State.Main;
-                    UpdateForPlayer();
-                });
+                    panel.Scrollbar.value = (indexHighBound - panel.Scrollbar.size) / (1 - panel.Scrollbar.size);
+                }
+                else if (lowScrollBound > indexLowBound)
+                {
+                    panel.Scrollbar.value = indexLowBound / (1 - panel.Scrollbar.size);
+                }
             }
         }
 
-        private void CreateDifficultyMenu()
+        private void UpdateForPlayer(PlayerMenuPanel panel)
         {
-            foreach (var difficulty in _possibleDifficulties)
+            // Set player text
+            var profile = panel.Player.Profile;
+            if (panel.HeaderText != null)
             {
-                bool selected = CurrentPlayer.Profile.CurrentDifficulty == difficulty;
-                CreateItem(difficulty.ToLocalizedName(), selected, () =>
+                UpdateHeaderIcon(panel, profile.GameMode);
+                if (panel.IsVocalGroup)
                 {
-                    CurrentPlayer.Profile.CurrentDifficulty
-                        = CurrentPlayer.Profile.DifficultyFallback
-                        = difficulty;
+                    string names = panel.VocalPlayers != null
+                        ? string.Join(", ", panel.VocalPlayers.Select(player => player.Profile.Name))
+                        : Instrument.Vocals.ToLocalizedName();
 
-                    _menuState = State.Main;
-                    UpdateForPlayer();
-                });
+                    SetHeaderText(panel.HeaderText, names, true);
+                }
+                else
+                {
+                    SetHeaderText(panel.HeaderText, profile.Name, false);
+                }
             }
+
+            // Reset content
+            panel.NavGroup?.ClearNavigatables();
+            panel.Container.DestroyChildren();
+
+            // Create the menu
+            switch (panel.MenuState)
+            {
+                case State.Main:
+                    CreateMainMenu(panel);
+                    break;
+                case State.Instrument:
+                    CreateInstrumentMenu(panel);
+                    break;
+                case State.Difficulty:
+                    CreateDifficultyMenu(panel);
+                    break;
+                case State.Modifiers:
+                    CreateModifierMenu(panel);
+                    break;
+                case State.Harmony:
+                    CreateHarmonyMenu(panel);
+                    break;
+            }
+
+            panel.LastMenuState = panel.MenuState;
         }
 
-        private void CreateModifierMenu()
+        private void CreateMainMenu(PlayerMenuPanel panel)
         {
-            var profile = CurrentPlayer.Profile;
+            var player = panel.Player;
 
-            _modifierItems.Clear();
-            foreach (var modifier in _possibleModifiers)
+            // Only show all these options if there are instruments available
+            if (panel.PossibleInstruments.Count > 0)
             {
-                var btn = Instantiate(_modifierItemPrefab, _container);
-                btn.Initialize(modifier.ToLocalizedName(), profile.IsModifierActive(modifier), active =>
+                // Ready button
+                CreateItem(panel, LocalizeHeader("Ready"), panel.LastMenuState == State.Main, _difficultyGreenPrefab, () =>
                 {
-                    // Enable/disable the modifier
-                    if (active)
+                    SetReady(panel, !panel.IsReady);
+                    TryStartGame();
+                });
+
+                CreateItem(panel, LocalizeHeader("Instrument"),
+                    player.Profile.CurrentInstrument.ToLocalizedName(),
+                    panel.LastMenuState == State.Instrument, () =>
+                {
+                    panel.MenuState = State.Instrument;
+                    UpdateForPlayer(panel);
+                });
+
+                CreateItem(panel, LocalizeHeader("Difficulty"),
+                    player.Profile.CurrentDifficulty.ToLocalizedName(),
+                    panel.LastMenuState == State.Difficulty, () =>
+                {
+                    panel.MenuState = State.Difficulty;
+                    UpdateForPlayer(panel);
+                });
+
+                // Harmony players must pick their harmony index unless multiple vocalists are grouped
+                bool allowHarmonySelect = player.Profile.CurrentInstrument == Instrument.Harmony
+                    && (!panel.IsVocalGroup || panel.VocalPlayers == null || panel.VocalPlayers.Count <= 1);
+                if (allowHarmonySelect)
+                {
+                    CreateItem(panel, LocalizeHeader("Harmony"),
+                        (player.Profile.HarmonyIndex + 1).ToString(),
+                        panel.LastMenuState == State.Harmony, () =>
                     {
-                        profile.AddSingleModifier(modifier);
+                        panel.MenuState = State.Harmony;
+                        UpdateForPlayer(panel);
+                    });
+                }
+
+                // Only allow vocal modifiers to be selected once (so they don't conflict)
+                if (player.Profile.GameMode != GameMode.Vocals ||
+                    _vocalModifierOwner == null ||
+                    _vocalModifierOwner == player ||
+                    (panel.IsVocalGroup && panel.VocalPlayers != null && panel.VocalPlayers.Contains(_vocalModifierOwner)))
+                {
+                    // Create modifiers body text
+                    string modifierText = "";
+                    if ((player.Profile.CurrentModifiers & ~panel.ExcusableModifiers) == Modifier.None)
+                    {
+                        // If there are no modifiers (ignoring the excusable ones), then just say "none"
+                        modifierText = Modifier.None.ToLocalizedName();
                     }
                     else
                     {
-                        profile.RemoveModifiers(modifier);
+                        // Combine all modifiers
+                        foreach (var modifier in panel.PossibleModifiers)
+                        {
+                            if (!player.Profile.IsModifierActive(modifier)) continue;
+
+                            modifierText += modifier.ToLocalizedName() + "\n";
+                        }
+
+                        modifierText = modifierText.Trim();
                     }
 
-                    UpdateModifierMenu();
+                    CreateItem(panel, LocalizeHeader("Modifiers"),
+                        modifierText, panel.LastMenuState == State.Modifiers, () =>
+                    {
+                        if (player.Profile.GameMode == GameMode.Vocals && _vocalModifierOwner == null)
+                            _vocalModifierOwner = player;
+
+                        panel.MenuState = State.Modifiers;
+                        UpdateForPlayer(panel);
+                    });
+                }
+            }
+
+            // Only show if there is more than one player, only if there is instruments available
+            if (panel.PossibleInstruments.Count <= 0 || PlayerContainer.Players.Count != 1)
+            {
+                // Sit out button
+                CreateItem(panel, LocalizeHeader("SitOut"), panel.PossibleInstruments.Count <= 0, _difficultyItemSmallRedPrefab, () =>
+                {
+                    if (_vocalModifierOwner == player ||
+                        (panel.IsVocalGroup && panel.VocalPlayers != null && panel.VocalPlayers.Contains(_vocalModifierOwner)))
+                    {
+                        _vocalModifierOwner = null;
+                    }
+
+                    SetReady(panel, false);
+                    if (panel.IsVocalGroup)
+                    {
+                        foreach (var vocalPlayer in panel.VocalPlayers)
+                        {
+                            vocalPlayer.SittingOut = true;
+                        }
+                    }
+                    else
+                    {
+                        player.SittingOut = true;
+                    }
+                    RebuildAllPlayers();
                 });
 
-                _navGroup.AddNavigatable(btn);
-                _modifierItems.Add(btn);
+                // Disconnect button
+                CreateItem(panel, LocalizeHeader("Disconnect"), panel.PossibleInstruments.Count <= 0, _difficultyItemSmallRedPrefab, () =>
+                {
+                    if (_vocalModifierOwner == player ||
+                        (panel.IsVocalGroup && panel.VocalPlayers != null && panel.VocalPlayers.Contains(_vocalModifierOwner)))
+                    {
+                        _vocalModifierOwner = null;
+                    }
+
+                    SetReady(panel, false);
+                    if (panel.IsVocalGroup)
+                    {
+                        foreach (var vocalPlayer in panel.VocalPlayers.ToArray())
+                        {
+                            PlayerContainer.DisposePlayer(vocalPlayer);
+                        }
+                    }
+                    else
+                    {
+                        PlayerContainer.DisposePlayer(player);
+                    }
+                    SetupMenuPanels();
+                    RebuildAllPlayers();
+                    LayoutPanels();
+                });
+            }
+        }
+        private void CreateInstrumentMenu(PlayerMenuPanel panel)
+        {
+            foreach (var instrument in panel.PossibleInstruments)
+            {
+                bool selected = panel.Player.Profile.CurrentInstrument == instrument;
+                CreateItem(panel, instrument.ToLocalizedName(), selected, () =>
+                {
+                    _lastActivePlayer = panel.Player;
+
+                    foreach (var target in EnumeratePanelPlayers(panel))
+                    {
+                        var profile = target.Profile;
+                        var preferredInstrument = profile.PreferredInstrument;
+                        profile.CurrentInstrument = instrument;
+
+                        // What we are doing here is resetting preferred instrument only if the current preferred instrument
+                        // was an option for this chart. This ensures that preferred instrument does not change when the
+                        // player is forced to use a different instrument.
+                        if (!panel.IsVocalGroup &&
+                            instrument != preferredInstrument &&
+                            panel.PossibleInstruments.Contains(preferredInstrument))
+                        {
+                            profile.PreferredInstrument = instrument;
+                        }
+                    }
+
+                    SetReady(panel, false);
+                    panel.MenuState = State.Main;
+                    RebuildAllPlayers();
+                });
+            }
+        }
+
+        private void CreateDifficultyMenu(PlayerMenuPanel panel)
+        {
+            foreach (var difficulty in panel.PossibleDifficulties)
+            {
+                bool selected = panel.Player.Profile.CurrentDifficulty == difficulty;
+                CreateItem(panel, difficulty.ToLocalizedName(), selected, () =>
+                {
+                    foreach (var target in EnumeratePanelPlayers(panel))
+                    {
+                        target.Profile.CurrentDifficulty
+                            = target.Profile.DifficultyFallback
+                            = difficulty;
+                    }
+
+                    SetReady(panel, false);
+                    panel.MenuState = State.Main;
+                    UpdateForPlayer(panel);
+                });
+            }
+        }
+
+        private void CreateModifierMenu(PlayerMenuPanel panel)
+        {
+            var profile = panel.Player.Profile;
+
+            panel.ModifierItems.Clear();
+            foreach (var modifier in panel.PossibleModifiers)
+            {
+                var btn = Instantiate(_modifierItemPrefab, panel.Container);
+                btn.Initialize(modifier.ToLocalizedName(), profile.IsModifierActive(modifier), active =>
+                {
+                    // Enable/disable the modifier
+                    foreach (var target in EnumeratePanelPlayers(panel))
+                    {
+                        if (active)
+                        {
+                            target.Profile.AddSingleModifier(modifier);
+                        }
+                        else
+                        {
+                            target.Profile.RemoveModifiers(modifier);
+                        }
+                    }
+
+                    SetReady(panel, false);
+                    UpdateModifierMenu(panel);
+                });
+
+                panel.NavGroup.AddNavigatable(btn);
+                panel.ModifierItems.Add(btn);
             }
 
             // Create done button
-            CreateItem(LocalizeHeader("Done"), _difficultyGreenPrefab, () =>
+            CreateItem(panel, LocalizeHeader("Done"), _difficultyGreenPrefab, () =>
             {
-                _menuState = State.Main;
-                UpdateForPlayer();
+                panel.MenuState = State.Main;
+                UpdateForPlayer(panel);
             });
 
-            _navGroup.SelectFirst();
+            panel.NavGroup?.SelectFirst();
         }
 
-        private void CreateHarmonyMenu()
+        private void CreateHarmonyMenu(PlayerMenuPanel panel)
         {
-            for (int i = 0; i < _maxHarmonyIndex; i++)
+            for (int i = 0; i < panel.MaxHarmonyIndex; i++)
             {
                 int capture = i;
-                bool selected = CurrentPlayer.Profile.HarmonyIndex == i;
-                CreateItem((i + 1).ToString(), selected, () =>
+                bool selected = panel.Player.Profile.HarmonyIndex == i;
+                CreateItem(panel, (i + 1).ToString(), selected, () =>
                 {
-                    CurrentPlayer.Profile.HarmonyIndex = (byte) capture;
+                    panel.Player.Profile.HarmonyIndex = (byte) capture;
 
-                    _menuState = State.Main;
-                    UpdateForPlayer();
+                    SetReady(panel, false);
+                    panel.MenuState = State.Main;
+                    UpdateForPlayer(panel);
                 });
             }
         }
 
-        private void UpdateModifierMenu()
+        private void UpdateModifierMenu(PlayerMenuPanel panel)
         {
-            var profile = CurrentPlayer.Profile;
+            var profile = panel.Player.Profile;
 
-            for (int i = 0; i < _modifierItems.Count; i++)
+            for (int i = 0; i < panel.ModifierItems.Count; i++)
             {
-                var item = _modifierItems[i];
-                var modifier = _possibleModifiers[i];
+                var item = panel.ModifierItems[i];
+                var modifier = panel.PossibleModifiers[i];
 
                 item.Active = profile.IsModifierActive(modifier);
             }
         }
 
-        private void UpdatePossibleModifiers()
+        private void UpdatePossibleModifiers(PlayerMenuPanel panel)
         {
-            var profile = CurrentPlayer.Profile;
+            var profile = panel.Player.Profile;
 
             // Get the possible modifiers (split the enum into multiple) and
             // make sure current modifiers are valid, and remove the invalid ones
-            _possibleModifiers.Clear();
+            panel.PossibleModifiers.Clear();
             var (possible, excusable) = profile.GameMode.PossibleModifiers(profile.CurrentInstrument);
-            _excusableModifiers = excusable;
+            panel.ExcusableModifiers = excusable;
 
             foreach (var modifier in EnumExtensions<Modifier>.Values)
             {
@@ -490,142 +564,21 @@ namespace YARG.Menu.DifficultySelect
                 {
                     // Also try to clear it if it isn't considered excusable yet the player somehow has it
                     if (((excusable & modifier) == 0) && profile.IsModifierActive(modifier))
-                    {
                         profile.RemoveModifiers(modifier);
-                    }
 
                     continue;
                 }
 
-                _possibleModifiers.Add(modifier);
-
-                if (profile.IsModifierActive(modifier) && !_possibleModifiers.Contains(modifier))
-                {
-                    profile.RemoveModifiers(modifier);
-                }
+                panel.PossibleModifiers.Add(modifier);
             }
 
         }
 
-        private void ChangePlayer(int add)
+        private void UpdatePossibleDifficulties(PlayerMenuPanel panel)
         {
-            _playerIndex += add;
-            _menuState = State.Main;
+            panel.PossibleDifficulties.Clear();
 
-            // When the user(s) have selected all of their difficulties, move on
-            if (_playerIndex >= PlayerContainer.Players.Count)
-            {
-                // If everyone is sitting out, show a warning and boot back to music library
-                if (PlayerContainer.Players.All(i => i.SittingOut))
-                {
-                    MenuManager.Instance.PopMenu();
-
-                    DialogManager.Instance.ShowMessage("Nobody's Playing!",
-                        "You tried to play a song with every player sitting out.");
-
-                    return;
-                }
-
-                // Ensure all vocal players have the same modifiers active
-                if (_vocalModifierSelectIndex != -1)
-                {
-                    // Call the player with the selected modifiers, the "primary player"
-                    var primaryPlayer = PlayerContainer.Players[_vocalModifierSelectIndex];
-
-                    // Copy modifiers to all other vocal players
-                    foreach (var player in PlayerContainer.Players)
-                    {
-                        if (player.SittingOut) continue;
-                        if (player == primaryPlayer) continue;
-
-                        if (player.Profile.GameMode == GameMode.Vocals)
-                        {
-                            player.Profile.CopyModifiers(primaryPlayer.Profile);
-                        }
-                    }
-                }
-
-                // This will always work (as it's set up in the input field)
-                // The max speed that the game can keep up with is 5000%
-                float speed = float.Parse(_speedInput.text.TrimEnd('%')) / 100f;
-                speed = Mathf.Clamp(speed, 0.1f, 50.0f);
-                _songSpeed = speed;
-                GlobalVariables.State.SongSpeed = speed;
-
-                GlobalVariables.Instance.LoadScene(SceneIndex.Gameplay);
-                return;
-            }
-
-            var profile = CurrentPlayer.Profile;
-            var song = GlobalVariables.State.CurrentSong;
-
-            // Get the possible instruments for this show and player
-            // TODO: We should probably allow players to select instruments that are not in
-            //  all songs and have them sit out songs that don't have that instrument
-            // TODO: We should also let Ekit users choose an option that switches them between
-            // each song's native drum format
-            _possibleInstruments.Clear();
-            var allowedInstruments = profile.GameMode.PossibleInstrumentsForSong(GlobalVariables.State.CurrentSong);
-
-            foreach (var instrument in allowedInstruments)
-            {
-                bool invalidInstrument = false;
-                foreach (var showSong in _songList)
-                {
-                    if (!HasPlayableInstrument(showSong, instrument))
-                    {
-                        invalidInstrument = true;
-                        break;
-                    }
-                }
-
-                if (!invalidInstrument)
-                {
-                    _possibleInstruments.Add(instrument);
-                }
-            }
-
-            // If the player's preferred instrument is available, set CurrentInstrument to that
-            if (_possibleInstruments.Contains(profile.PreferredInstrument))
-            {
-                profile.CurrentInstrument = profile.PreferredInstrument;
-            }
-
-            // Set the instrument to a valid one
-            if (!_possibleInstruments.Contains(profile.CurrentInstrument) && _possibleInstruments.Count > 0)
-            {
-                profile.CurrentInstrument = _possibleInstruments[0];
-            }
-
-            // Get the possible harmonies for this show
-            _maxHarmonyIndex = song.VocalsCount;
-            foreach (var showsong in GlobalVariables.State.ShowSongs)
-            {
-                _maxHarmonyIndex = Mathf.Min(_maxHarmonyIndex, showsong.VocalsCount);
-            }
-
-            // Set the harmony index to a valid one
-            if (profile.HarmonyIndex >= _maxHarmonyIndex)
-            {
-                profile.HarmonyIndex = 0;
-            }
-
-            UpdatePossibleModifiers();
-
-            // Don't sit out by default
-            CurrentPlayer.SittingOut = false;
-
-            // Update the possible difficulties as well
-            UpdatePossibleDifficulties();
-
-            UpdateForPlayer();
-        }
-
-        private void UpdatePossibleDifficulties()
-        {
-            _possibleDifficulties.Clear();
-
-            var profile = CurrentPlayer.Profile;
+            var profile = panel.Player.Profile;
 
             // Get the possible difficulties for the player's instrument in the song
             foreach (var difficulty in EnumExtensions<Difficulty>.Values)
@@ -641,15 +594,12 @@ namespace YARG.Menu.DifficultySelect
                 }
 
                 if (!invalidDifficulty)
-                {
-                    _possibleDifficulties.Add(difficulty);
-                }
+                    panel.PossibleDifficulties.Add(difficulty);
             }
 
             // TODO: Handle difficulty fallback better in play a show mode
-
             var diff = (int) profile.DifficultyFallback;
-            while (diff >= (int) Difficulty.Beginner && !_possibleDifficulties.Contains((Difficulty) diff))
+            while (diff >= (int) Difficulty.Beginner && !panel.PossibleDifficulties.Contains((Difficulty) diff))
             {
                 --diff;
             }
@@ -660,10 +610,7 @@ namespace YARG.Menu.DifficultySelect
                 while (diff < (int) Difficulty.ExpertPlus)
                 {
                     ++diff;
-                    if (_possibleDifficulties.Contains((Difficulty) diff))
-                    {
-                        break;
-                    }
+                    if (panel.PossibleDifficulties.Contains((Difficulty) diff)) break;
                 }
             }
             profile.CurrentDifficulty = (Difficulty) diff;
@@ -672,11 +619,12 @@ namespace YARG.Menu.DifficultySelect
         private void OnDisable()
         {
             Navigator.Instance.PopScheme();
+            ClearPanels();
         }
 
-        private void CreateItem(string header, string body, bool selected, DifficultyItem difficultyItem, UnityAction a)
+        private void CreateItem(PlayerMenuPanel panel, string header, string body, bool selected, DifficultyItem difficultyItem, UnityAction a)
         {
-            var btn = Instantiate(difficultyItem, _container);
+            var btn = Instantiate(difficultyItem, panel.Container);
 
             if (header is null)
             {
@@ -687,27 +635,30 @@ namespace YARG.Menu.DifficultySelect
                 btn.Initialize(header, body, a);
             }
 
-            _navGroup.AddNavigatable(btn.Button);
+            panel.NavGroup.AddNavigatable(btn.Button);
 
             if (selected)
-            {
-                _navGroup.SelectLast();
-            }
+                panel.NavGroup?.SelectLast();
         }
 
-        private void CreateItem(string body, bool selected, DifficultyItem difficultyItem, UnityAction a)
+        private void CreateItem(PlayerMenuPanel panel, string body, bool selected, DifficultyItem difficultyItem, UnityAction a)
         {
-            CreateItem(null, body, selected, difficultyItem, a);
+            CreateItem(panel, null, body, selected, difficultyItem, a);
         }
 
-        private void CreateItem(string header, string body, bool selected, UnityAction a)
+        private void CreateItem(PlayerMenuPanel panel, string body, DifficultyItem difficultyItem, UnityAction a)
         {
-            CreateItem(header, body, selected, _difficultyItemPrefab, a);
+            CreateItem(panel, null, body, false, difficultyItem, a);
         }
 
-        private void CreateItem(string body, bool selected, UnityAction a)
+        private void CreateItem(PlayerMenuPanel panel, string header, string body, bool selected, UnityAction a)
         {
-            CreateItem(null, body, selected, a);
+            CreateItem(panel, header, body, selected, _difficultyItemPrefab, a);
+        }
+
+        private void CreateItem(PlayerMenuPanel panel, string body, bool selected, UnityAction a)
+        {
+            CreateItem(panel, null, body, selected, a);
         }
 
         private string LocalizeHeader(string key)
@@ -717,25 +668,12 @@ namespace YARG.Menu.DifficultySelect
 
         private bool HasPlayableInstrument(SongEntry entry, in Instrument instrument)
         {
-            // For vocals, all players *must* select the same gamemode (solo/harmony)
+            // For vocals, all players must select the same gamemode (solo/harmony).
+            // We enforce the sync in NormalizeVocalSelections(), not here.
             if (instrument is Instrument.Vocals or Instrument.Harmony)
             {
                 if (!entry.HasInstrument(instrument))
-                {
                     return false;
-                }
-
-                // Loop through all of the players up to the current one
-                // to see what has already been selected.
-                for (int i = 0; i < _playerIndex; i++)
-                {
-                    var player = PlayerContainer.Players[i];
-                    var playerInstrument = player.Profile.CurrentInstrument;
-                    if (playerInstrument is Instrument.Vocals or Instrument.Harmony)
-                    {
-                        return playerInstrument == instrument;
-                    }
-                }
             }
 
             return entry.HasInstrument(instrument) || instrument switch
@@ -753,9 +691,7 @@ namespace YARG.Menu.DifficultySelect
         {
             // For vocals, insert special difficulties
             if (instrument is Instrument.Vocals or Instrument.Harmony)
-            {
                 return difficulty is not (Difficulty.Beginner or Difficulty.ExpertPlus);
-            }
 
             // Otherwise, we can do this
             return entry[instrument][difficulty] || instrument switch
@@ -768,17 +704,586 @@ namespace YARG.Menu.DifficultySelect
                 _ => false
             };
         }
-
         public void SongSpeedEndEdit(string text)
         {
             if (!float.TryParse(text.TrimEnd('%'), NumberStyles.Number, null, out var speed))
-            {
                 speed = 100;
-            }
 
             int intSpeed = (int) Math.Clamp(speed, 10, 5000);
 
             _speedInput.SetTextWithoutNotify($"{intSpeed}%");
+        }
+
+        private void SetupMenuPanels()
+        {
+            ClearPanels();
+            EnsureMenusRoot();
+            _menuTemplate = FindMenuTemplate();
+            _menuTemplate.SetParent(_menusRoot, false);
+
+            int maxPlayers = Math.Min(PlayerContainer.Players.Count, 6);
+            var vocalPlayers = PlayerContainer.Players
+                .Take(maxPlayers)
+                .Where(player => player.Profile.GameMode == GameMode.Vocals)
+                .ToList();
+
+            PlayerMenuPanel vocalPanel = null;
+            int createdIndex = 0;
+
+            for (int i = 0; i < maxPlayers; i++)
+            {
+                var player = PlayerContainer.Players[i];
+                bool isVocal = player.Profile.GameMode == GameMode.Vocals;
+                if (isVocal && vocalPanel != null)
+                {
+                    _panelByPlayer[player] = vocalPanel;
+                    continue;
+                }
+
+                RectTransform root;
+                if (createdIndex == 0)
+                {
+                    root = _menuTemplate;
+                }
+                else
+                {
+                    root = Instantiate(_menuTemplate, _menusRoot);
+                    root.name = $"Menu_Player_{i + 1}";
+                }
+
+                var panel = CreatePanel(player, root, createdIndex == 0);
+                if (isVocal)
+                {
+                    panel.IsVocalGroup = true;
+                    panel.VocalPlayers = vocalPlayers;
+                    vocalPanel = panel;
+                    foreach (var vocalPlayer in vocalPlayers)
+                    {
+                        _panelByPlayer[vocalPlayer] = panel;
+                    }
+                }
+                else
+                {
+                    _panelByPlayer[player] = panel;
+                }
+
+                _panels.Add(panel);
+                createdIndex++;
+            }
+        }
+
+        private void ClearPanels()
+        {
+            foreach (var panel in _panels)
+            {
+                if (panel.NavGroup != null && panel.SelectionHandler != null)
+                    panel.NavGroup.SelectionChanged -= panel.SelectionHandler;
+
+                if (panel.Root != null && panel.Root != _menuTemplate)
+                    Destroy(panel.Root.gameObject);
+            }
+
+            _panels.Clear();
+            _panelByPlayer.Clear();
+            _readyPlayers.Clear();
+            _vocalModifierOwner = null;
+        }
+
+        private void EnsureMenusRoot()
+        {
+            if (_menusRoot != null) return;
+
+            var go = new GameObject("PlayerMenusRoot", typeof(RectTransform));
+            _menusRoot = go.GetComponent<RectTransform>();
+            _menusRoot.SetParent(transform, false);
+            _menusRoot.anchorMin = Vector2.zero;
+            _menusRoot.anchorMax = Vector2.one;
+            _menusRoot.offsetMin = Vector2.zero;
+            _menusRoot.offsetMax = Vector2.zero;
+            _menusRoot.localScale = Vector3.one;
+        }
+
+        private RectTransform FindMenuTemplate()
+        {
+            if (_menuTemplate != null)
+                return _menuTemplate;
+
+            Transform current = _container != null ? _container : _navGroup?.transform;
+            while (current != null && current.name != "Menu")
+            {
+                current = current.parent;
+            }
+
+            if (current == null)
+                throw new InvalidOperationException("Failed to locate menu template root named 'Menu'.");
+
+            return (RectTransform) current;
+        }
+
+        private PlayerMenuPanel CreatePanel(YargPlayer player, RectTransform root, bool isTemplate)
+        {
+            var panel = new PlayerMenuPanel
+            {
+                Player = player,
+                Root = root,
+                MenuState = State.Main,
+                LastMenuState = State.Main
+            };
+
+            if (isTemplate)
+            {
+                panel.Container = _container;
+                panel.NavGroup = _navGroup;
+                panel.HeaderText = _text;
+                panel.Scrollbar = root.GetComponentInChildren<Scrollbar>(true);
+                EnsureHeaderBaseFontSize(panel.HeaderText);
+                panel.HeaderIcon = EnsureHeaderIcon(panel.HeaderText);
+            }
+            else
+            {
+                panel.NavGroup = root.GetComponentInChildren<NavigationGroup>(true);
+                panel.Container = panel.NavGroup != null ? panel.NavGroup.transform : root;
+
+                var header = root.Find("Header");
+                if (header != null)
+                {
+                    var headerTextTransform = header.Find("Text (TMP)") ?? header;
+                    panel.HeaderText = headerTextTransform.GetComponentInChildren<TextMeshProUGUI>(true);
+                }
+
+                if (panel.HeaderText == null)
+                    panel.HeaderText = root.GetComponentInChildren<TextMeshProUGUI>(true);
+
+                panel.Scrollbar = root.GetComponentInChildren<Scrollbar>(true);
+                EnsureHeaderBaseFontSize(panel.HeaderText);
+                panel.HeaderIcon = EnsureHeaderIcon(panel.HeaderText);
+            }
+
+            panel.SelectionHandler = (selected, origin) => UpdateForSelectionChanged(panel, selected, origin);
+            if (panel.NavGroup != null)
+                panel.NavGroup.SelectionChanged += panel.SelectionHandler;
+
+            return panel;
+        }
+        private void LayoutPanels()
+        {
+            if (_panels.Count == 0 || _menuTemplate == null) return;
+
+            int count = _panels.Count;
+            int cols = count <= 3 ? count : 3;
+            int rows = Mathf.CeilToInt(count / (float) cols);
+
+            float spacingX = 40f;
+            float spacingY = 40f;
+
+            float panelWidth = _menuTemplate.rect.width;
+            float panelHeight = _menuTemplate.rect.height;
+
+            float availableWidth = _menusRoot.rect.width;
+            float availableHeight = _menusRoot.rect.height;
+            if (availableWidth <= 0 || availableHeight <= 0)
+            {
+                availableWidth = 1920f;
+                availableHeight = 1080f;
+            }
+
+            float scaleX = (availableWidth - spacingX * (cols - 1)) / (panelWidth * cols);
+            float scaleY = (availableHeight - spacingY * (rows - 1)) / (panelHeight * rows);
+            float scale = Mathf.Min(1f, scaleX, scaleY);
+
+            float scaledWidth = panelWidth * scale;
+            float scaledHeight = panelHeight * scale;
+
+            float totalWidth = cols * scaledWidth + spacingX * (cols - 1);
+            float startX = -totalWidth / 2f + scaledWidth / 2f;
+            float startY = _menuTemplate.anchoredPosition.y;
+
+            for (int i = 0; i < _panels.Count; i++)
+            {
+                int row = i / cols;
+                int col = i % cols;
+
+                float x = startX + col * (scaledWidth + spacingX);
+                float y = startY - row * (scaledHeight + spacingY);
+
+                var root = _panels[i].Root;
+                root.anchoredPosition = new Vector2(x, y);
+                root.localScale = new Vector3(scale, scale, 1f);
+            }
+        }
+
+        private void RebuildAllPlayers()
+        {
+            if (_panels.Count == 0) return;
+
+            NormalizeVocalSelections();
+
+            _globalMaxHarmonyIndex = GlobalVariables.State.CurrentSong.VocalsCount;
+            foreach (var showSong in _songList)
+            {
+                _globalMaxHarmonyIndex = Mathf.Min(_globalMaxHarmonyIndex, showSong.VocalsCount);
+            }
+
+            foreach (var panel in _panels)
+            {
+                var profile = panel.Player.Profile;
+                var previousInstrument = profile.CurrentInstrument;
+                panel.MaxHarmonyIndex = _globalMaxHarmonyIndex;
+
+                panel.PossibleInstruments.Clear();
+                var allowedInstruments = profile.GameMode.PossibleInstrumentsForSong(GlobalVariables.State.CurrentSong);
+
+                foreach (var instrument in allowedInstruments)
+                {
+                    bool invalidInstrument = false;
+                    foreach (var showSong in _songList)
+                    {
+                        if (!HasPlayableInstrument(showSong, instrument))
+                        {
+                            invalidInstrument = true;
+                            break;
+                        }
+                    }
+
+                    if (!invalidInstrument)
+                        panel.PossibleInstruments.Add(instrument);
+                }
+
+                // If the player's preferred instrument is available, set CurrentInstrument to that
+                if (!panel.IsVocalGroup && panel.PossibleInstruments.Contains(profile.PreferredInstrument))
+                    profile.CurrentInstrument = profile.PreferredInstrument;
+
+                // Set the instrument to a valid one
+                if (!panel.PossibleInstruments.Contains(profile.CurrentInstrument) && panel.PossibleInstruments.Count > 0)
+                    profile.CurrentInstrument = panel.PossibleInstruments[0];
+
+                if (profile.CurrentInstrument != previousInstrument)
+                    SetReady(panel, false);
+
+                // Set the harmony index to a valid one
+                if (profile.HarmonyIndex >= panel.MaxHarmonyIndex)
+                    profile.HarmonyIndex = 0;
+
+                UpdatePossibleModifiers(panel);
+                UpdatePossibleDifficulties(panel);
+
+                if (panel.IsVocalGroup)
+                    SyncVocalGroupSettings(panel);
+            }
+
+            StatsManager.Instance.UpdateActivePlayers();
+
+            foreach (var panel in _panels)
+            {
+                UpdateForPlayer(panel);
+            }
+        }
+
+        private void SetReady(PlayerMenuPanel panel, bool ready)
+        {
+            panel.IsReady = ready;
+            foreach (var target in EnumeratePanelPlayers(panel))
+            {
+                if (ready)
+                {
+                    _readyPlayers.Add(target);
+                }
+                else
+                {
+                    _readyPlayers.Remove(target);
+                }
+            }
+        }
+
+        private bool AreAllPlayersReady()
+        {
+            foreach (var player in PlayerContainer.Players)
+            {
+                if (player.SittingOut) continue;
+
+                if (!_readyPlayers.Contains(player))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private void TryStartGame()
+        {
+            if (!AreAllPlayersReady()) return;
+
+            // If everyone is sitting out, show a warning and boot back to music library
+            if (PlayerContainer.Players.All(i => i.SittingOut))
+            {
+                MenuManager.Instance.PopMenu();
+
+                DialogManager.Instance.ShowMessage("Nobody's Playing!",
+                    "You tried to play a song with every player sitting out.");
+
+                return;
+            }
+
+            // Ensure all vocal players have the same modifiers active
+            if (_vocalModifierOwner != null)
+            {
+                var primaryPlayer = _vocalModifierOwner;
+
+                foreach (var player in PlayerContainer.Players)
+                {
+                    if (player.SittingOut) continue;
+                    if (player == primaryPlayer) continue;
+
+                    if (player.Profile.GameMode == GameMode.Vocals)
+                        player.Profile.CopyModifiers(primaryPlayer.Profile);
+                }
+            }
+
+            // This will always work (as it's set up in the input field)
+            // The max speed that the game can keep up with is 5000%
+            float speed = float.Parse(_speedInput.text.TrimEnd('%')) / 100f;
+            speed = Mathf.Clamp(speed, 0.1f, 50.0f);
+            _songSpeed = speed;
+            GlobalVariables.State.SongSpeed = speed;
+
+            GlobalVariables.Instance.LoadScene(SceneIndex.Gameplay);
+        }
+
+        private void UpdateWarningForPlayer(YargPlayer player)
+        {
+            if (player == null)
+            {
+                ShowWarning(null);
+                return;
+            }
+
+            if (player.IsMissingMicrophone)
+            {
+                ShowWarning(Localize.Key("Menu.DifficultySelect.WarningVocalistNoMicrophone"));
+            }
+            else if (player.IsMissingInputDevice)
+            {
+                ShowWarning(Localize.Key("Menu.DifficultySelect.WarningPlayerNoInputDevice"));
+            }
+            else
+            {
+                ShowWarning(null);
+            }
+        }
+
+        private bool TryGetPanel(YargPlayer player, out PlayerMenuPanel panel)
+        {
+            if (player != null && _panelByPlayer.TryGetValue(player, out panel))
+                return true;
+
+            panel = null;
+            return false;
+        }
+
+        private Image EnsureHeaderIcon(TextMeshProUGUI label)
+        {
+            if (label == null)
+                return null;
+
+            var header = label.transform.parent;
+            if (header == null)
+                return null;
+
+            var iconTransform = header.Find("HeaderIcon");
+            if (iconTransform == null)
+            {
+                var iconObject = new GameObject("HeaderIcon", typeof(RectTransform), typeof(Image));
+                iconTransform = iconObject.transform;
+                iconTransform.SetParent(header, false);
+            }
+
+            var rect = (RectTransform) iconTransform;
+            ConfigureHeaderIconRect(rect);
+
+            var image = iconTransform.GetComponent<Image>();
+            image.raycastTarget = false;
+            image.preserveAspect = true;
+            return image;
+        }
+
+        private void EnsureHeaderBaseFontSize(TextMeshProUGUI label)
+        {
+            if (_headerBaseFontSize > 0f || label == null) return;
+
+            if (label.enableAutoSizing && label.fontSizeMax > 0f)
+            {
+                _headerBaseFontSize = label.fontSizeMax;
+            }
+            else
+            {
+                _headerBaseFontSize = label.fontSize > 0f ? label.fontSize : 20f;
+            }
+        }
+
+        private void UpdateHeaderIcon(PlayerMenuPanel panel, GameMode gameMode)
+        {
+            if (panel.HeaderIcon == null) return;
+
+            ConfigureHeaderIconRect(panel.HeaderIcon.rectTransform);
+
+            string resourceName = gameMode.ToResourceName();
+            if (string.IsNullOrEmpty(resourceName))
+            {
+                panel.HeaderIcon.enabled = false;
+                return;
+            }
+
+            if (!_headerIconCache.TryGetValue(resourceName, out var sprite))
+            {
+                sprite = Addressables.LoadAssetAsync<Sprite>($"InstrumentIcons[{resourceName}]").WaitForCompletion();
+                _headerIconCache[resourceName] = sprite;
+            }
+
+            panel.HeaderIcon.sprite = sprite;
+            panel.HeaderIcon.enabled = sprite != null;
+        }
+
+        private void ConfigureHeaderIconRect(RectTransform rect)
+        {
+            rect.anchorMin = new Vector2(0f, 0.5f);
+            rect.anchorMax = new Vector2(0f, 0.5f);
+            rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.anchoredPosition = HeaderIconAnchoredPosition;
+            rect.sizeDelta = new Vector2(HeaderIconSize, HeaderIconSize);
+        }
+
+        private void SetHeaderText(TextMeshProUGUI label, string text, bool shrinkIfLong)
+        {
+            const int maxCharsBeforeShrink = 60;
+            const float shrinkFactor = 0.6f;
+
+            if (label == null)
+            {
+                return;
+            }
+
+            EnsureHeaderBaseFontSize(label);
+
+            var measureText = RichTextUtils.StripRichTextTags(text);
+
+            label.enableAutoSizing = false;
+            label.textWrappingMode = TextWrappingModes.Normal;
+            label.overflowMode = TextOverflowModes.Overflow;
+            label.fontSize = _headerBaseFontSize;
+
+            if (shrinkIfLong && measureText.Length > maxCharsBeforeShrink)
+                label.fontSize = _headerBaseFontSize * shrinkFactor;
+
+            var icon = label.transform.parent?.Find("HeaderIcon")?.GetComponent<RectTransform>();
+            if (icon != null)
+            {
+                float padding = 16f;
+                float leftMargin = icon.rect.width > 0f ? icon.rect.width + padding : 0f;
+                label.margin = new Vector4(leftMargin, 0f, 0f, 0f);
+            }
+
+            label.text = text;
+        }
+
+        private IEnumerable<YargPlayer> EnumeratePanelPlayers(PlayerMenuPanel panel)
+        {
+            if (panel.IsVocalGroup && panel.VocalPlayers != null)
+                return panel.VocalPlayers;
+
+            return new[] { panel.Player };
+        }
+
+        private void AssignHarmonyIndices(PlayerMenuPanel panel)
+        {
+            if (!panel.IsVocalGroup || panel.VocalPlayers == null) return;
+
+            if (panel.Player.Profile.CurrentInstrument != Instrument.Harmony)
+            {
+                foreach (var player in panel.VocalPlayers)
+                {
+                    player.Profile.HarmonyIndex = 0;
+                }
+                return;
+            }
+
+            if (panel.VocalPlayers.Count <= 1)
+                return;
+
+            int maxHarmony = Math.Max(panel.MaxHarmonyIndex, 1);
+            int harmonyIndex = 0;
+            foreach (var player in panel.VocalPlayers)
+            {
+                if (player.SittingOut)
+                {
+                    player.Profile.HarmonyIndex = 0;
+                    continue;
+                }
+
+                int assigned = Math.Min(harmonyIndex, maxHarmony - 1);
+                player.Profile.HarmonyIndex = (byte) assigned;
+                harmonyIndex++;
+            }
+        }
+
+        private void SyncVocalGroupSettings(PlayerMenuPanel panel)
+        {
+            if (!panel.IsVocalGroup || panel.VocalPlayers == null) return;
+
+            var primary = panel.Player.Profile;
+            foreach (var player in panel.VocalPlayers)
+            {
+                if (player == panel.Player) continue;
+
+                var profile = player.Profile;
+                profile.CurrentInstrument = primary.CurrentInstrument;
+                profile.CurrentDifficulty = primary.CurrentDifficulty;
+                profile.DifficultyFallback = primary.DifficultyFallback;
+                profile.CopyModifiers(primary);
+            }
+
+            AssignHarmonyIndices(panel);
+        }
+
+        private void NormalizeVocalSelections()
+        {
+            var vocalPlayers = PlayerContainer.Players
+                .Where(player => player.Profile.GameMode == GameMode.Vocals)
+                .ToList();
+
+            if (vocalPlayers.Count == 0) return;
+
+            Instrument? selected = null;
+            if (_lastActivePlayer != null &&
+                !_lastActivePlayer.SittingOut &&
+                vocalPlayers.Contains(_lastActivePlayer))
+            {
+                var activeInstrument = _lastActivePlayer.Profile.CurrentInstrument;
+                if (activeInstrument is Instrument.Vocals or Instrument.Harmony)
+                    selected = activeInstrument;
+            }
+
+            if (!selected.HasValue)
+            {
+                var firstVocal = vocalPlayers.FirstOrDefault();
+                if (firstVocal != null)
+                {
+                    var instrument = firstVocal.Profile.CurrentInstrument;
+                    if (instrument is Instrument.Vocals or Instrument.Harmony)
+                        selected = instrument;
+                }
+            }
+
+            if (!selected.HasValue) return;
+
+            foreach (var player in vocalPlayers)
+            {
+                var instrument = player.Profile.CurrentInstrument;
+                if (instrument != selected.Value)
+                {
+                    player.Profile.CurrentInstrument = selected.Value;
+                    if (TryGetPanel(player, out var panel))
+                        SetReady(panel, false);
+                }
+            }
         }
     }
 }
